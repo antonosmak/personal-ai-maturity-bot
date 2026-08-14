@@ -1,11 +1,22 @@
 from __future__ import annotations
-import json, mimetypes, os, sqlite3
+
+import io
+import json
+import math
+import os
+import secrets
+import sqlite3
+import tempfile
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-import httpx
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import requests
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
@@ -13,364 +24,385 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 MATRIX = json.loads((BASE_DIR / "matrix.json").read_text(encoding="utf-8"))
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+SHEETS_URL = os.getenv("GOOGLE_SHEETS_WEBHOOK_URL", "").strip()
+SHEETS_SECRET = os.getenv("GOOGLE_SHEETS_WEBHOOK_SECRET", "").strip()
+DB_PATH = Path(os.getenv("DB_PATH", "/tmp/personal_ai_maturity.db"))
+AUTHOR_NAME = os.getenv("AUTHOR_NAME", "Антон Осьмак").strip()
+VERSION = "0.2.0"
+
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+
+TG_API = f"https://api.telegram.org/bot{TOKEN}"
 DIMENSIONS = []
 for item in MATRIX:
-    if item["dimension"] not in [d[0] for d in DIMENSIONS]:
+    if item["dimension"] not in [x[0] for x in DIMENSIONS]:
         DIMENSIONS.append((item["dimension"], item["dimension_name"]))
 
-TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
-DB_PATH = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "personal_ai_maturity.db")))
-PUBLIC_BOT_USERNAME = (os.getenv("PUBLIC_BOT_USERNAME", "") or "").strip()
-CONTACT_EMAIL = (os.getenv("CONTACT_EMAIL", "") or "").strip()
-AUTHOR = (os.getenv("AUTHOR_NAME", "Антон Осьмак") or "Антон Осьмак").strip()
-if not TOKEN:
-    raise SystemExit("Не задано TELEGRAM_BOT_TOKEN")
-API = f"https://api.telegram.org/bot{TOKEN}"
-
 SCALE = {
-    0: "Не знаю / не використовую",
-    1: "Загальне уявлення / поодинокий досвід",
-    2: "Несистемно / невпевнено",
-    3: "Самостійно у типових ситуаціях",
-    4: "Системно, усвідомлено та впевнено",
-    5: "Системно, адаптивно, можу пояснити іншим",
+    0: "Не знаю / не використовую / така практика відсутня",
+    1: "Маю лише загальне уявлення або поодинокий досвід",
+    2: "Використовую інколи, але несистемно та невпевнено",
+    3: "Використовую самостійно у типових ситуаціях",
+    4: "Використовую системно, усвідомлено та впевнено",
+    5: "Використовую системно, можу адаптувати практику до нових ситуацій та пояснити її іншим",
 }
+
+CLASSIFIERS = [
+    ("sector", "Сфера діяльності", [
+        "Публічний сектор", "Бізнес", "Освіта і наука", "Громадський сектор", "Інше"
+    ]),
+    ("position", "Тип посади / статус", [
+        "Керівник", "Фахівець", "Викладач-дослідник", "Здобувач освіти", "Інше"
+    ]),
+    ("age_group", "Вікова група", ["до 25", "25–34", "35–44", "45–54", "55+"]),
+    ("ai_experience", "Досвід використання ШІ", ["<1 року", "1–2 роки", "3+ роки"]),
+]
 
 def db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
 
 def init_db():
     with db() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS assessments(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            user_id INTEGER,
-            username TEXT,
-            status TEXT NOT NULL DEFAULT 'running',
-            current_index INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            finished_at TEXT
+        CREATE TABLE IF NOT EXISTS tests(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          chat_id INTEGER NOT NULL,
+          test_id TEXT NOT NULL UNIQUE,
+          status TEXT NOT NULL,
+          classifier_index INTEGER NOT NULL DEFAULT 0,
+          question_index INTEGER NOT NULL DEFAULT 0,
+          sector TEXT, position TEXT, age_group TEXT, ai_experience TEXT,
+          created_at TEXT NOT NULL, finished_at TEXT, sheets_saved INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS answers(
-            assessment_id INTEGER NOT NULL,
-            code TEXT NOT NULL,
-            score INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY(assessment_id,code)
+          test_id TEXT NOT NULL, code TEXT NOT NULL, score INTEGER NOT NULL,
+          PRIMARY KEY(test_id, code)
         );
         """)
+init_db()
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
-def maturity_level(v):
-    return (
-        "I — Початковий" if v <= 20 else
-        "II — Фрагментарний" if v <= 40 else
-        "III — Системний" if v <= 60 else
-        "IV — Інтегрований" if v <= 80 else
-        "V — Трансформаційний"
-    )
+def tg(method: str, payload=None, files=None):
+    r = requests.post(f"{TG_API}/{method}", data=payload or {}, files=files, timeout=45)
+    r.raise_for_status()
+    return r.json()
 
-def calc_results(aid):
+def send(chat_id, text, reply_markup=None):
+    p = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        p["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    return tg("sendMessage", p)
+
+def answer_callback(callback_id):
+    try:
+        tg("answerCallbackQuery", {"callback_query_id": callback_id})
+    except Exception:
+        pass
+
+def configure_telegram_webhook():
+    if not RENDER_EXTERNAL_URL:
+        return
+    url = RENDER_EXTERNAL_URL + "/telegram/webhook"
+    p = {"url": url, "allowed_updates": json.dumps(["message","callback_query"])}
+    if TG_SECRET:
+        p["secret_token"] = TG_SECRET
+    try:
+        tg("setWebhook", p)
+    except Exception as e:
+        print("Webhook setup error:", e)
+
+def make_test_id():
+    return "PAIM-" + datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + secrets.token_hex(3).upper()
+
+def latest_test(chat_id):
     with db() as c:
-        rows = c.execute("SELECT code,score FROM answers WHERE assessment_id=?", (aid,)).fetchall()
+        return c.execute("SELECT * FROM tests WHERE chat_id=? ORDER BY id DESC LIMIT 1",(chat_id,)).fetchone()
+
+def start_test(chat_id):
+    tid = make_test_id()
+    with db() as c:
+        c.execute("""INSERT INTO tests(chat_id,test_id,status,created_at)
+                     VALUES(?,?,?,?)""",(chat_id,tid,"classify",now_iso()))
+    send(chat_id,
+         "PERSONAL AI MATURITY INDEX (PAIMI)\n\n"
+         "Самооцінювання персональної ШІ-зрілості: 48 тверджень у 8 вимірах D1–D8.\n"
+         "Перед тестом — 4 необов’язкові класифікаційні питання для агрегованого дослідження. "
+         "Вони не впливають на результат і їх можна пропустити.\n\n"
+         "Шкала відповідей: 0–5.")
+    ask_classifier(chat_id, tid, 0)
+
+def ask_classifier(chat_id, test_id, idx):
+    if idx >= len(CLASSIFIERS):
+        with db() as c:
+            c.execute("UPDATE tests SET status='testing', classifier_index=4 WHERE test_id=?",(test_id,))
+        send(chat_id, "Класифікаційний блок завершено. Починаємо 48 тверджень.")
+        ask_question(chat_id, test_id, 0)
+        return
+    key, title, options = CLASSIFIERS[idx]
+    rows = [[{"text": opt, "callback_data": f"cls:{idx}:{i}"}] for i,opt in enumerate(options)]
+    rows.append([{"text":"Пропустити", "callback_data":f"cls:{idx}:skip"}])
+    send(chat_id, f"{idx+1}/4. {title}", {"inline_keyboard": rows})
+
+def ask_question(chat_id, test_id, idx):
+    item = MATRIX[idx]
+    buttons = [[
+        {"text": str(s), "callback_data": f"score:{idx}:{s}"} for s in range(6)
+    ]]
+    text = (
+        f"{idx+1}/48  {item['code']} — {item['criterion']}\n"
+        f"{item['dimension']}. {item['dimension_name']}\n\n"
+        f"{item['question']}\n\n"
+        "Оцініть від 0 до 5."
+    )
+    send(chat_id, text, {"inline_keyboard": buttons})
+
+def calc(test_id):
+    with db() as c:
+        rows = c.execute("SELECT code,score FROM answers WHERE test_id=?",(test_id,)).fetchall()
     scores = {r["code"]: int(r["score"]) for r in rows}
     dims = {}
-    for d, _ in DIMENSIONS:
-        codes = [x["code"] for x in MATRIX if x["dimension"] == d]
-        vals = [scores[k] for k in codes if k in scores]
-        dims[d] = (sum(vals) / (5 * len(vals)) * 100) if vals else None
-    n = len(scores)
-    paimi = sum(scores.values()) / (5 * n) * 100 if n else 0
-    return {"scores": scores, "dims": dims, "paimi": paimi, "answered": n, "complete": n == 48}
+    for dim,_ in DIMENSIONS:
+        codes=[x["code"] for x in MATRIX if x["dimension"]==dim]
+        vals=[scores[c] for c in codes if c in scores]
+        dims[dim] = sum(vals)/(len(codes)*5)*100 if len(vals)==len(codes) else 0.0
+    complete = len(scores)==48
+    paim = sum(scores.values())/(48*5)*100 if complete else 0.0
+    return {"scores":scores,"dims":dims,"paim":paim,"complete":complete}
 
-async def tg(method, payload=None, files=None):
-    async with httpx.AsyncClient(timeout=60) as client:
-        if files:
-            r = await client.post(f"{API}/{method}", data=payload or {}, files=files)
-        else:
-            r = await client.post(f"{API}/{method}", json=payload or {})
-        if r.status_code >= 400:
-            print("Telegram API error:", method, r.status_code, r.text[:1000], flush=True)
-            raise RuntimeError(f"Telegram {method}: HTTP {r.status_code}")
-        data = r.json()
-        if not data.get("ok", True):
-            raise RuntimeError(data)
-        return data.get("result")
+def maturity_level(p):
+    if p <= 20: return "I — Початковий"
+    if p <= 40: return "II — Фрагментарний"
+    if p <= 60: return "III — Системний"
+    if p <= 80: return "IV — Інтегрований"
+    return "V — Трансформаційний"
 
-async def send(chat, text, keyboard=None):
-    payload = {"chat_id": chat, "text": text}
-    if keyboard:
-        payload["reply_markup"] = {"inline_keyboard": keyboard}
-    await tg("sendMessage", payload)
+def profile_name(dims):
+    vals=list(dims.values())
+    if max(vals)-min(vals) <= 10:
+        return "Збалансований профіль"
+    strongest=max(dims,key=dims.get)
+    return f"Профіль з провідним виміром {strongest}"
 
-async def send_start(chat, text):
-    await tg("sendMessage", {
-        "chat_id": chat,
-        "text": text,
-        "reply_markup": {
-            "keyboard": [[{"text": "▶️ Розпочати оцінювання"}]],
-            "resize_keyboard": True,
-            "one_time_keyboard": False,
-        },
-    })
-
-async def send_document(chat, path, caption=""):
-    with path.open("rb") as f:
-        await tg("sendDocument", {"chat_id": str(chat), "caption": caption},
-                 {"document": (path.name, f, "application/pdf")})
-
-async def send_photo(chat, path, caption=""):
-    with path.open("rb") as f:
-        await tg("sendPhoto", {"chat_id": str(chat), "caption": caption},
-                 {"photo": (path.name, f, "image/png")})
-
-async def configure_telegram_ui():
-    commands = [
-        {"command": "start", "description": "▶️ Старт / головний екран"},
-        {"command": "new", "description": "Розпочати нове оцінювання"},
-        {"command": "status", "description": "Стан оцінювання"},
-        {"command": "log", "description": "Журнал оцінювань"},
-        {"command": "pdf", "description": "Останній PDF-звіт"},
-        {"command": "cancel", "description": "Скасувати поточне оцінювання"},
-    ]
-    try:
-        await tg("setMyCommands", {"commands": commands})
-        await tg("setChatMenuButton", {"menu_button": {"type": "commands"}})
-        await tg("setMyShortDescription", {
-            "short_description": "Самооцінювання персональної ШІ-зрілості за 48 показниками D1–D8."
-        })
-        await tg("setMyDescription", {
-            "description": (
-                "Personal AI Maturity Bot — експериментальний дослідницький інструмент "
-                "самооцінювання персональної ШІ-зрілості. 48 показників, 8 блоків, "
-                "індекс PAIMI та PDF-звіт. Результат є самооцінкою і не є об’єктивним "
-                "вимірюванням компетентностей.\n/start — розпочати оцінювання"
-            )
-        })
-    except Exception as e:
-        print("Telegram UI warning:", repr(e), flush=True)
-
-def score_keyboard(aid, idx):
-    return [[{"text": str(score), "callback_data": f"score:{aid}:{idx}:{score}"} for score in range(6)]]
-
-def repeat_keyboard(aid):
-    return [[{"text": "🔄 Повторити оцінювання", "callback_data": f"repeat:{aid}"}]]
-
-async def start_assessment(chat, user):
-    with db() as c:
-        active = c.execute(
-            "SELECT id FROM assessments WHERE chat_id=? AND status='running' ORDER BY id DESC LIMIT 1",
-            (chat,),
-        ).fetchone()
-        if active:
-            await send(chat, f"У вас уже є незавершене оцінювання №{active['id']}. Продовжіть його або використайте /cancel.")
-            return
-        cur = c.execute(
-            "INSERT INTO assessments(chat_id,user_id,username,status,current_index,created_at) VALUES(?,?,?,?,?,?)",
-            (chat, user.get("id"), user.get("username"), "running", 0, now_iso()),
-        )
-        aid = cur.lastrowid
-    await send(
-        chat,
-        "Оцінювання містить 48 тверджень у 8 блоках D1–D8.\n\n"
-        "Оберіть для кожного твердження бал 0–5 відповідно до фактичної сформованості вашої практики взаємодії зі ШІ.\n\n"
-        "0 — не знаю / не використовую;\n1 — загальне уявлення / поодинокий досвід;\n"
-        "2 — використовую інколи, несистемно;\n3 — самостійно у типових ситуаціях;\n"
-        "4 — системно, усвідомлено та впевнено;\n5 — системно, адаптивно, можу пояснити іншим."
-    )
-    await ask_question(chat, aid, 0)
-
-async def ask_question(chat, aid, idx):
-    x = MATRIX[idx]
-    await send(
-        chat,
-        f"{idx+1}/48  {x['code']} — {x['criterion']}\n{x['dimension']} — {x['dimension_name']}\n\n{x['statement']}\n\nОцініть 0–5:",
-        score_keyboard(aid, idx),
-    )
-
-def make_radar(aid):
-    r = calc_results(aid)
-    labels = [d[0] for d in DIMENSIONS]
-    values = [r["dims"][d] or 0 for d in labels]
-    vals = values + values[:1]
-    angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False).tolist()
+def make_radar(test_id, dims):
+    labels=[d for d,_ in DIMENSIONS]
+    values=[dims[d] for d in labels]
+    values += values[:1]
+    angles=np.linspace(0,2*np.pi,len(labels),endpoint=False).tolist()
     angles += angles[:1]
-    fig = plt.figure(figsize=(8, 8))
-    ax = plt.subplot(111, polar=True)
-    ax.plot(angles, vals, linewidth=2)
-    ax.fill(angles, vals, alpha=.15)
-    ax.set_thetagrids(np.degrees(angles[:-1]), labels)
-    ax.set_ylim(0, 100)
-    ax.set_yticks([20, 40, 60, 80, 100])
-    ax.set_title(f'Профіль персональної ШІ-зрілості\nPAIMI = {r["paimi"]:.1f}%', pad=25)
-    out = BASE_DIR / "exports" / f"personal_ai_radar_{aid}.png"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    return out
+    fig=plt.figure(figsize=(6.4,6.4))
+    ax=plt.subplot(111,polar=True)
+    ax.plot(angles,values,linewidth=2)
+    ax.fill(angles,values,alpha=.12)
+    ax.set_thetagrids(np.degrees(angles[:-1]),labels)
+    ax.set_ylim(0,100); ax.set_yticks([20,40,60,80,100])
+    ax.set_title("Профіль персональної ШІ-зрілості",pad=22)
+    p=Path(tempfile.gettempdir())/f"{test_id}_radar.png"
+    fig.savefig(p,dpi=160,bbox_inches="tight"); plt.close(fig)
+    return p
 
-def _fonts():
-    reg = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    if Path(reg).exists():
-        if "DejaVu" not in pdfmetrics.getRegisteredFontNames():
-            pdfmetrics.registerFont(TTFont("DejaVu", reg))
-            pdfmetrics.registerFont(TTFont("DejaVuBold", bold))
-        return "DejaVu", "DejaVuBold"
-    return "Helvetica", "Helvetica-Bold"
+def _font():
+    candidates=[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"
+    ]
+    for p in candidates:
+        if Path(p).exists():
+            try:
+                pdfmetrics.registerFont(TTFont("PAIMFont",p))
+                return "PAIMFont"
+            except Exception:
+                pass
+    return "Helvetica"
 
-def export_pdf(aid):
+def make_pdf(test_row, result):
+    font=_font()
+    styles=getSampleStyleSheet()
+    title=ParagraphStyle("TitleUA",parent=styles["Title"],fontName=font,fontSize=20,leading=25,alignment=TA_CENTER)
+    h=ParagraphStyle("HUA",parent=styles["Heading2"],fontName=font,fontSize=13,leading=17)
+    body=ParagraphStyle("BodyUA",parent=styles["BodyText"],fontName=font,fontSize=9.5,leading=13)
+    small=ParagraphStyle("SmallUA",parent=body,fontSize=8,leading=10)
+    path=Path(tempfile.gettempdir())/f"PAIM_Report_{test_row['test_id']}.pdf"
+    doc=SimpleDocTemplate(str(path),pagesize=A4,rightMargin=16*mm,leftMargin=16*mm,topMargin=16*mm,bottomMargin=16*mm)
+    story=[
+        Spacer(1,18*mm),
+        Paragraph("PERSONAL AI MATURITY INDEX (PAIMI)",title),
+        Spacer(1,5*mm),
+        Paragraph("Звіт про самооцінювання персональної ШІ-зрілості",h),
+        Spacer(1,12*mm),
+        Paragraph(f"Test ID: {test_row['test_id']}",body),
+        Paragraph(f"Дата: {test_row['finished_at'] or test_row['created_at']}",body),
+        Spacer(1,15*mm),
+        Paragraph(f"PAIMI: <b>{result['paim']:.1f}%</b>",title),
+        Paragraph(f"Рівень: <b>{maturity_level(result['paim'])}</b>",h),
+        Spacer(1,10*mm),
+        Paragraph("Методика: 48 тверджень, 8 вимірів, шкала 0–5. PAIMI = сума балів / 240 × 100%. "
+                  "Результат є самооцінкою і не є об’єктивним вимірюванням професійної кваліфікації.",body),
+        Spacer(1,8*mm),
+        Paragraph(f"© {AUTHOR_NAME}",small),
+        PageBreak()
+    ]
+    data=[["Вимір","Назва","Результат, %"]]
+    for dim,name in DIMENSIONS:
+        data.append([dim,name,f"{result['dims'][dim]:.1f}"])
+    t=Table(data,colWidths=[18*mm,105*mm,30*mm],repeatRows=1)
+    t.setStyle(TableStyle([
+        ("FONTNAME",(0,0),(-1,-1),font),("FONTSIZE",(0,0),(-1,-1),8.5),
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#E8E8E8")),
+        ("GRID",(0,0),(-1,-1),0.35,colors.grey),("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("ALIGN",(2,1),(2,-1),"RIGHT")
+    ]))
+    story += [Paragraph("Результати за вимірами D1–D8",h),Spacer(1,3*mm),t,Spacer(1,6*mm)]
+    radar=make_radar(test_row["test_id"],result["dims"])
+    story.append(Image(str(radar),width=120*mm,height=120*mm))
+    story.append(PageBreak())
+    story.append(Paragraph("Відповіді",h))
+    ans=[["Код","Бал","Твердження"]]
+    for item in MATRIX:
+        ans.append([item["code"],str(result["scores"].get(item["code"],"")),Paragraph(item["question"],small)])
+    at=Table(ans,colWidths=[18*mm,14*mm,140*mm],repeatRows=1)
+    at.setStyle(TableStyle([
+        ("FONTNAME",(0,0),(-1,-1),font),("FONTSIZE",(0,0),(-1,-1),7.5),
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#E8E8E8")),
+        ("GRID",(0,0),(-1,-1),0.25,colors.lightgrey),("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("ALIGN",(1,1),(1,-1),"CENTER")
+    ]))
+    story.append(at)
+    doc.build(story)
+    return path
+
+def save_to_sheets(test_row, result):
+    if not SHEETS_URL or not SHEETS_SECRET:
+        return False
+    level_full=maturity_level(result["paim"])
+    level_roman=level_full.split(" ",1)[0]
+    payload={
+        "secret":SHEETS_SECRET,
+        "test_id":test_row["test_id"],
+        "timestamp":test_row["finished_at"] or now_iso(),
+        "sector":test_row["sector"] or "",
+        "position":test_row["position"] or "",
+        "age_group":test_row["age_group"] or "",
+        "ai_experience":test_row["ai_experience"] or "",
+        **{d.lower(): round(result["dims"][d],2) for d,_ in DIMENSIONS},
+        "paim":round(result["paim"],2),
+        "level":level_roman,
+        "profile":profile_name(result["dims"]),
+        "answers":[
+            {"question":item["code"],"dimension":item["dimension"],"score":result["scores"][item["code"]]}
+            for item in MATRIX
+        ]
+    }
+    try:
+        r=requests.post(SHEETS_URL,json=payload,timeout=30,allow_redirects=True)
+        r.raise_for_status()
+        data=r.json()
+        return bool(data.get("ok"))
+    except Exception as e:
+        print("Google Sheets write error:",repr(e))
+        return False
+
+def finish(chat_id, test_id):
+    result=calc(test_id)
+    if not result["complete"]:
+        send(chat_id,"Не всі 48 відповідей отримано. Продовжіть тест.")
+        return
+    finished=now_iso()
     with db() as c:
-        a = c.execute("SELECT * FROM assessments WHERE id=?", (aid,)).fetchone()
-        rows = c.execute("SELECT code,score FROM answers WHERE assessment_id=?", (aid,)).fetchall()
-    if not a:
-        raise RuntimeError("Оцінювання не знайдено")
-    by = {r["code"]: int(r["score"]) for r in rows}
-    r = calc_results(aid)
-    out = BASE_DIR / "exports" / f"Personal_AI_Maturity_Assessment_{aid}.pdf"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    font, bold = _fonts()
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="U", parent=styles["BodyText"], fontName=font, fontSize=8.5, leading=11))
-    styles.add(ParagraphStyle(name="H", parent=styles["Heading2"], fontName=bold, fontSize=13))
-    styles.add(ParagraphStyle(name="T", parent=styles["Title"], fontName=bold, fontSize=17, alignment=TA_CENTER))
-    def footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont(font, 6.2)
-        canvas.drawCentredString(A4[0]/2, 10*mm, "Personal AI Maturity Bot — експериментальний дослідницький інструмент оцінювання персональної ШІ-зрілості.")
-        canvas.drawCentredString(A4[0]/2, 7*mm, "Результат відображає самооцінку респондента і не є об’єктивним вимірюванням знань, компетентностей або професійної кваліфікації.")
-        contact = []
-        if PUBLIC_BOT_USERNAME:
-            contact.append(PUBLIC_BOT_USERNAME if PUBLIC_BOT_USERNAME.startswith("@") else "@" + PUBLIC_BOT_USERNAME)
-        if CONTACT_EMAIL:
-            contact.append(CONTACT_EMAIL)
-        contact.append(f"©2026, {AUTHOR}")
-        canvas.drawCentredString(A4[0]/2, 4*mm, " · ".join(contact))
-        canvas.restoreState()
-    doc = SimpleDocTemplate(str(out), pagesize=A4, rightMargin=12*mm, leftMargin=12*mm, topMargin=12*mm, bottomMargin=21*mm)
-    story = [Paragraph("Personal AI Maturity Assessment", styles["T"]), Paragraph("Звіт за результатами самооцінювання персональної ШІ-зрілості", styles["H"])]
-    meta = [["ID оцінювання", str(a["id"])], ["PAIMI", f"{r['paimi']:.1f}%"], ["Рівень", maturity_level(r["paimi"])], ["Відповідей", f"{r['answered']}/48"]]
-    t = Table([[Paragraph(str(v), styles["U"]) for v in row] for row in meta], colWidths=[45*mm, 135*mm])
-    t.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.4,colors.grey),("FONTNAME",(0,0),(0,-1),bold),("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story += [t, Spacer(1,4*mm), Paragraph("<b>Методологічне застереження.</b> Результат відображає самооцінку персональної ШІ-зрілості респондента та не є об’єктивним вимірюванням його знань, компетентностей або професійної кваліфікації. Інструмент має експериментальний дослідницький характер і використовується в межах розробки та апробації методики оцінювання персональної ШІ-зрілості.", styles["U"]), Spacer(1,4*mm), Image(str(make_radar(aid)), width=125*mm, height=125*mm), PageBreak(), Paragraph("Результати за блоками D1–D8", styles["H"])]
-    dimdata = [["Блок","Назва","Результат"]]
-    for d, dname in DIMENSIONS:
-        value = r["dims"][d]
-        dimdata.append([d,dname,f"{value:.1f}%" if value is not None else "—"])
-    td = Table([[Paragraph(str(v),styles["U"]) for v in row] for row in dimdata], colWidths=[20*mm,125*mm,35*mm], repeatRows=1)
-    td.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.4,colors.grey),("FONTNAME",(0,0),(-1,0),bold),("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story += [td, Spacer(1,5*mm), Paragraph("Деталізація 48 показників", styles["H"])]
-    data = [["Код","Маркер","Бал","Інтерпретація"]]
-    for x in MATRIX:
-        score = by.get(x["code"])
-        data.append([x["code"], x["criterion"], str(score) if score is not None else "—", SCALE.get(score,"—") if score is not None else "—"])
-    tt = Table([[Paragraph(str(v),styles["U"]) for v in row] for row in data], colWidths=[16*mm,92*mm,18*mm,54*mm], repeatRows=1)
-    tt.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.3,colors.grey),("FONTNAME",(0,0),(-1,0),bold),("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story.append(tt)
-    doc.build(story, onFirstPage=footer, onLaterPages=footer)
-    return out
+        c.execute("UPDATE tests SET status='finished',finished_at=? WHERE test_id=?",(finished,test_id))
+        row=c.execute("SELECT * FROM tests WHERE test_id=?",(test_id,)).fetchone()
+    sheets_ok=save_to_sheets(row,result)
+    if sheets_ok:
+        with db() as c: c.execute("UPDATE tests SET sheets_saved=1 WHERE test_id=?",(test_id,))
+    level=maturity_level(result["paim"])
+    lines=[
+        "Оцінювання завершено.",
+        f"PAIMI: {result['paim']:.1f}%",
+        f"Рівень: {level}",
+        "",
+        *[f"{d}: {result['dims'][d]:.1f}%" for d,_ in DIMENSIONS],
+    ]
+    send(chat_id,"\n".join(lines))
+    pdf=make_pdf(row,result)
+    with open(pdf,"rb") as f:
+        tg("sendDocument",{"chat_id":chat_id,"caption":f"PAIMI — {row['test_id']}"},
+           {"document":(pdf.name,f,"application/pdf")})
 
-async def finish_assessment(chat, aid):
-    with db() as c:
-        c.execute("UPDATE assessments SET status='finished',finished_at=? WHERE id=?", (now_iso(), aid))
-    r = calc_results(aid)
-    await send_photo(chat, make_radar(aid), "Профіль персональної ШІ-зрілості")
-    dims = "\n".join(f"{d}: {r['dims'][d]:.1f}%" for d,_ in DIMENSIONS if r["dims"][d] is not None)
-    await send(chat, f"Оцінювання №{aid} завершено.\nPAIMI: {r['paimi']:.1f}%\nРівень: {maturity_level(r['paimi'])}\n\n{dims}\n\nРезультат є самооцінкою персональної ШІ-зрілості і не є об’єктивним вимірюванням компетентностей.")
-    await send_document(chat, export_pdf(aid), "Фінальний PDF-звіт персональної ШІ-зрілості")
-    await send(chat, "Оцінювання завершено. Ви можете пройти його повторно.", repeat_keyboard(aid))
+def process_update(update: dict[str,Any]):
+    if "callback_query" in update:
+        cb=update["callback_query"]; answer_callback(cb["id"])
+        msg=cb.get("message",{}); chat_id=msg.get("chat",{}).get("id")
+        data=cb.get("data","")
+        if not chat_id: return
+        row=latest_test(chat_id)
+        if not row: return
+        if data.startswith("cls:") and row["status"]=="classify":
+            _,idx_s,val=data.split(":",2); idx=int(idx_s)
+            if idx != row["classifier_index"]: return
+            key,title,options=CLASSIFIERS[idx]
+            chosen="" if val=="skip" else options[int(val)]
+            with db() as c:
+                c.execute(f"UPDATE tests SET {key}=?,classifier_index=? WHERE test_id=?",(chosen,idx+1,row["test_id"]))
+            ask_classifier(chat_id,row["test_id"],idx+1)
+            return
+        if data.startswith("score:") and row["status"]=="testing":
+            _,idx_s,score_s=data.split(":"); idx=int(idx_s); score=int(score_s)
+            if idx != row["question_index"] or score not in range(6): return
+            item=MATRIX[idx]
+            with db() as c:
+                c.execute("INSERT OR REPLACE INTO answers(test_id,code,score) VALUES(?,?,?)",(row["test_id"],item["code"],score))
+                c.execute("UPDATE tests SET question_index=? WHERE test_id=?",(idx+1,row["test_id"]))
+            if idx+1<48: ask_question(chat_id,row["test_id"],idx+1)
+            else: finish(chat_id,row["test_id"])
+            return
 
-async def handle_message(msg):
-    chat = msg["chat"]["id"]
-    user = msg.get("from", {})
-    text = (msg.get("text") or "").strip()
-    if not text:
+    msg=update.get("message") or {}
+    chat_id=msg.get("chat",{}).get("id")
+    text=(msg.get("text") or "").strip()
+    if not chat_id: return
+    if text in ("/start","/help"):
+        send(chat_id,
+             "Personal AI Maturity Bot — v0.2.0\n\n"
+             "/new — нове самооцінювання\n"
+             "/status — стан поточного тесту\n"
+             "/report — повторно отримати PDF останнього завершеного тесту\n"
+             "/cancel — скасувати поточне проходження")
         return
-    if text == "/start":
-        welcome = ("Вітаємо в Personal AI Maturity Bot!\n\nЦе експериментальний дослідницький інструмент для самооцінювання персональної ШІ-зрілості.\n\nОцінювання складається з 48 показників у 8 блоках D1–D8. Після проходження ви отримаєте індекс PAIMI, профіль D1–D8 та PDF-звіт.\n\nВажливо: результат відображає самооцінку респондента та не є об’єктивним вимірюванням знань, компетентностей або професійної кваліфікації.\n\n" + f"©2026, {AUTHOR}")
-        await send_start(chat, welcome)
+    if text=="/new":
+        start_test(chat_id); return
+    if text=="/status":
+        row=latest_test(chat_id)
+        if not row: send(chat_id,"Активних тестувань немає."); return
+        send(chat_id,f"Test ID: {row['test_id']}\nСтатус: {row['status']}\nВідповідей: {row['question_index']}/48")
         return
-    if text in ("/new", "▶️ Розпочати оцінювання"):
-        await start_assessment(chat, user)
+    if text=="/cancel":
+        row=latest_test(chat_id)
+        if row and row["status"] in ("classify","testing"):
+            with db() as c: c.execute("UPDATE tests SET status='cancelled' WHERE test_id=?",(row["test_id"],))
+            send(chat_id,"Поточне тестування скасовано.")
+        else: send(chat_id,"Активного тестування немає.")
         return
-    if text == "/cancel":
-        with db() as c:
-            a = c.execute("SELECT id FROM assessments WHERE chat_id=? AND status='running' ORDER BY id DESC LIMIT 1", (chat,)).fetchone()
-            if a:
-                c.execute("UPDATE assessments SET status='cancelled' WHERE id=?", (a["id"],))
-        await send(chat, "Поточне оцінювання скасовано." if a else "Немає активного оцінювання.")
+    if text=="/report":
+        row=latest_test(chat_id)
+        if not row or row["status"]!="finished":
+            send(chat_id,"Завершеного тестування не знайдено."); return
+        result=calc(row["test_id"]); pdf=make_pdf(row,result)
+        with open(pdf,"rb") as f:
+            tg("sendDocument",{"chat_id":chat_id,"caption":f"PAIMI — {row['test_id']}"},
+               {"document":(pdf.name,f,"application/pdf")})
         return
-    if text == "/status":
-        with db() as c:
-            a = c.execute("SELECT * FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat,)).fetchone()
-        if not a:
-            await send(chat, "Оцінювань ще немає. /new")
-            return
-        r = calc_results(a["id"])
-        await send(chat, f"Оцінювання №{a['id']} | статус: {a['status']} | відповідей: {r['answered']}/48")
-        return
-    if text == "/log":
-        with db() as c:
-            rows = c.execute("SELECT id,status FROM assessments WHERE chat_id=? ORDER BY id DESC LIMIT 10", (chat,)).fetchall()
-        if not rows:
-            await send(chat, "Журнал порожній.")
-            return
-        lines = ["Останні оцінювання:"]
-        for a in rows:
-            r = calc_results(a["id"])
-            lines.append(f"№{a['id']} — {a['status']} — {r['answered']}/48 — PAIMI {r['paimi']:.1f}%")
-        await send(chat, "\n".join(lines))
-        return
-    if text.startswith("/pdf"):
-        parts = text.split()
-        with db() as c:
-            last = c.execute("SELECT id FROM assessments WHERE chat_id=? AND status='finished' ORDER BY id DESC LIMIT 1", (chat,)).fetchone()
-        aid = int(parts[1]) if len(parts)>1 and parts[1].isdigit() else (last["id"] if last else None)
-        if not aid:
-            await send(chat, "Завершених оцінювань ще немає.")
-            return
-        await send_document(chat, export_pdf(aid), "PDF-звіт персональної ШІ-зрілості")
-        return
-
-async def handle_callback(cb):
-    data = cb.get("data", "")
-    chat = (cb.get("message") or {}).get("chat", {}).get("id")
-    if not chat:
-        return
-    await tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
-    parts = data.split(":")
-    if parts[0] == "repeat" and len(parts) == 2:
-        await start_assessment(chat, cb.get("from", {}))
-        return
-    if parts[0] == "score" and len(parts) == 4:
-        aid, idx, score = map(int, parts[1:])
-        if idx < 0 or idx >= 48 or score not in range(6):
-            return
-        with db() as c:
-            a = c.execute("SELECT * FROM assessments WHERE id=? AND chat_id=?", (aid,chat)).fetchone()
-            if not a or a["status"] != "running":
-                return
-            x = MATRIX[idx]
-            c.execute("INSERT OR REPLACE INTO answers(assessment_id,code,score,created_at) VALUES(?,?,?,?)", (aid,x["code"],score,now_iso()))
-            c.execute("UPDATE assessments SET current_index=? WHERE id=?", (idx+1,aid))
-        await send(chat, f"{MATRIX[idx]['code']}: {score}/5 — {SCALE[score]}")
-        if idx+1 < 48:
-            await ask_question(chat, aid, idx+1)
-        else:
-            await finish_assessment(chat, aid)
-
-async def process_update(update):
-    if "message" in update:
-        await handle_message(update["message"])
-    elif "callback_query" in update:
-        await handle_callback(update["callback_query"])
+    send(chat_id,"Не розпізнав команду. Використайте /help.")
