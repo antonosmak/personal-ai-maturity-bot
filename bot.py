@@ -113,7 +113,7 @@ RECOMMENDATIONS = {
 FOOTER_LINES = [
     "Personal AI Maturity Bot — дослідницький інформаційно-аналітичний інструмент для комплексного оцінювання персональної AI-зрілості.",
     "Результат є самооцінкою і не є об’єктивним вимірюванням професійної кваліфікації.",
-    "@AI_Maturity_Bot · ai.maturity.bot@gmail.com · ©2026, Антон Осьмак",
+    "@PersonalAIMaturityBot · ai.maturity.bot@gmail.com · ©2026, Антон Осьмак",
 ]
 
 def db():
@@ -210,7 +210,7 @@ Personal AI Maturity Bot — дослідницький інформаційно
 
 Personal AI Maturity Bot
 Дослідницький інформаційно-аналітичний інструмент
-@AI_Maturity_Bot · ai.maturity.bot@gmail.com
+@PersonalAIMaturityBot · ai.maturity.bot@gmail.com
 ©2026, Антон Осьмак"""
 
 def configure_telegram_webhook():
