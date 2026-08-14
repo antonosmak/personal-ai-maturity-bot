@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "Personal AI Maturity Bot", "version": "0.2.0"})
+    return jsonify({"ok": True, "service": "Personal AI Maturity Bot", "version": "1.0"})
 
 @app.post("/telegram/webhook")
 def telegram_webhook():
